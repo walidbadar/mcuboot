@@ -437,13 +437,20 @@ SYS_INIT(arm64_map_exec_ram, APPLICATION, 0);
 #endif /* CONFIG_MMU */
 
 /*
- * Turn the EL1 MMU and data cache off and branch to the image. Only registers
- * are used once the data cache is off, so no stale stack line can be read
- * back. The image is entered as the ARM64 Linux boot protocol requires: MMU
- * off, data cache off, all exceptions masked.
+ * Turn the EL1 MMU and data cache off and branch to target with x0-x3 set to
+ * a0-a3. Only registers are used once the data cache is off, so no stale
+ * stack line can be read back. The target runs as the ARM64 Linux boot
+ * protocol requires: MMU off, data cache off, all exceptions masked.
  */
-static FUNC_NORETURN void arm64_jump_mmu_off(uintptr_t entry)
+static FUNC_NORETURN void arm64_jump_mmu_off(uintptr_t target, uint64_t a0,
+                                             uint64_t a1, uint64_t a2,
+                                             uint64_t a3)
 {
+    register uint64_t x0 __asm__("x0") = a0;
+    register uint64_t x1 __asm__("x1") = a1;
+    register uint64_t x2 __asm__("x2") = a2;
+    register uint64_t x3 __asm__("x3") = a3;
+
     __asm__ volatile("msr daifset, #0xf\n\t"
                      "mrs x9, sctlr_el1\n\t"
                      "bic x9, x9, %[mask]\n\t"
@@ -453,18 +460,75 @@ static FUNC_NORETURN void arm64_jump_mmu_off(uintptr_t entry)
                      "tlbi vmalle1\n\t"
                      "dsb sy\n\t"
                      "isb\n\t"
-                     "br %[entry]\n\t"
+                     "br %[target]\n\t"
                      :
                      : [mask] "r"((uint64_t)(SCTLR_M_BIT | SCTLR_C_BIT)),
-                       [entry] "r"(entry)
+                       [target] "r"(target), "r"(x0), "r"(x1), "r"(x2), "r"(x3)
                      : "x9", "memory");
 
     CODE_UNREACHABLE;
 }
 
+#if defined(CONFIG_BOOT_RAM_LOAD_RELOCATE)
+/*
+ * Position independent stub, copied after the loaded image and run there
+ * with the MMU off: move x2 bytes (a non-zero multiple of 8) from x1 down to
+ * x0, drop the instruction cache, which may still hold MCUboot code from the
+ * destination, and branch to x3.
+ */
+__asm__(".pushsection .text.arm64_reloc_stub, \"ax\"\n"
+        ".balign 8\n"
+        ".global arm64_reloc_stub\n"
+        "arm64_reloc_stub:\n"
+        "1:  ldr x4, [x1], #8\n"
+        "    str x4, [x0], #8\n"
+        "    subs x2, x2, #8\n"
+        "    b.hi 1b\n"
+        "    dsb sy\n"
+        "    ic iallu\n"
+        "    dsb sy\n"
+        "    isb\n"
+        "    br x3\n"
+        ".global arm64_reloc_stub_end\n"
+        "arm64_reloc_stub_end:\n"
+        ".popsection\n");
+
+extern const uint8_t arm64_reloc_stub[];
+extern const uint8_t arm64_reloc_stub_end[];
+#endif /* CONFIG_BOOT_RAM_LOAD_RELOCATE */
+
 static void do_boot(struct boot_rsp *rsp)
 {
-    uintptr_t entry = rsp->br_hdr->ih_load_addr + rsp->br_hdr->ih_hdr_size;
+    uintptr_t load = rsp->br_hdr->ih_load_addr;
+    uintptr_t target = load + rsp->br_hdr->ih_hdr_size;
+    uint64_t args[4] = { 0 };
+
+#if defined(CONFIG_BOOT_RAM_LOAD_RELOCATE)
+    /* The image, header included, moves to the relocation address. The
+     * copy runs forward, so the destination must lie below the image, and
+     * the stub goes after it, inside the executable RAM area.
+     */
+    uintptr_t dst = CONFIG_BOOT_RAM_LOAD_RELOCATE_ADDR;
+    size_t len = ROUND_UP((size_t)rsp->br_hdr->ih_hdr_size + rsp->br_hdr->ih_img_size, 8);
+    size_t stub_len = (size_t)(arm64_reloc_stub_end - arm64_reloc_stub);
+    uintptr_t stub = ROUND_UP(load + len, 8);
+
+    if ((((load | dst) & 7U) != 0U) || (dst >= load) ||
+        (stub + stub_len > (uintptr_t)CONFIG_BOOT_IMAGE_EXECUTABLE_RAM_START +
+                           CONFIG_BOOT_IMAGE_EXECUTABLE_RAM_SIZE)) {
+        BOOT_LOG_ERR("Cannot move image from 0x%lx to 0x%lx", (unsigned long)load,
+                     (unsigned long)dst);
+        FIH_PANIC;
+    }
+
+    memcpy((void *)stub, arm64_reloc_stub, stub_len);
+
+    args[0] = dst;
+    args[1] = load;
+    args[2] = len;
+    args[3] = dst + rsp->br_hdr->ih_hdr_size;
+    target = stub;
+#endif /* CONFIG_BOOT_RAM_LOAD_RELOCATE */
 
     (void)irq_lock();
 
@@ -475,13 +539,13 @@ static void do_boot(struct boot_rsp *rsp)
     write_sysreg(0, cntp_ctl_el0);
     barrier_isync_fence_full();
 
-    /* Write every dirty line back to memory and drop it, so the image sees
-     * in memory what was written while the data cache was on.
+    /* Write every dirty line back to memory and drop it, so the image and
+     * the stub are in memory when they are read with the data cache off.
      */
     (void)sys_cache_data_flush_and_invd_all();
     (void)sys_cache_instr_invd_all();
 
-    arm64_jump_mmu_off(entry);
+    arm64_jump_mmu_off(target, args[0], args[1], args[2], args[3]);
 }
 
 #else

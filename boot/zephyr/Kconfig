@@ -632,6 +632,21 @@ config BOOT_IMAGE_EXECUTABLE_RAM_SIZE
 	int "Boot image executable base size"
 	default $(dt_chosen_reg_size_int,$(DT_CHOSEN_Z_SRAM),0)
 
+config BOOT_RAM_LOAD_RELOCATE
+	bool "Move the loaded image to MCUboot's own address before starting it"
+	depends on ARM64 && !MULTIPLE_EXECUTABLE_RAM_REGIONS
+	help
+	  If y, the image is loaded and validated at its load address, then
+	  moved to BOOT_RAM_LOAD_RELOCATE_ADDR, which may overlap MCUboot
+	  itself, and started there. The move runs with the MMU off from a
+	  stub placed after the loaded image, so the executable RAM area must
+	  have room for it. The image is linked for the relocation address and
+	  signed with the load address inside the executable RAM area.
+
+config BOOT_RAM_LOAD_RELOCATE_ADDR
+	hex "Address the loaded image is moved to"
+	depends on BOOT_RAM_LOAD_RELOCATE
+	default $(dt_chosen_reg_addr_hex,$(DT_CHOSEN_Z_SRAM))
 endif
 
 config MULTIPLE_EXECUTABLE_RAM_REGIONS
