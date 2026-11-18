@@ -16,6 +16,10 @@ config MCUBOOT
 	select MPU_ALLOW_FLASH_WRITE if ARM_MPU
 	select USE_DT_CODE_PARTITION if HAS_FLASH_LOAD_OFFSET
 	select MCUBOOT_BOOTUTIL_LIB
+	# The ARM64 handoff cleans the whole data cache before the jump
+	select ARM64_DCACHE_ALL_OPS if ARM64 && CACHE_MANAGEMENT && DCACHE
+	# ARM64 maps the executable RAM area 1:1 to load the image there
+	select KERNEL_DIRECT_MAP if ARM64 && MMU
 
 config BOOT_USE_MBEDTLS
 	bool
@@ -627,6 +631,7 @@ config BOOT_IMAGE_EXECUTABLE_RAM_START
 config BOOT_IMAGE_EXECUTABLE_RAM_SIZE
 	int "Boot image executable base size"
 	default $(dt_chosen_reg_size_int,$(DT_CHOSEN_Z_SRAM),0)
+
 endif
 
 config MULTIPLE_EXECUTABLE_RAM_REGIONS

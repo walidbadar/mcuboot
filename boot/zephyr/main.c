@@ -37,6 +37,14 @@
 #include <cmsis_core.h>
 #endif
 
+#if defined(CONFIG_ARM64)
+#include <zephyr/cache.h>
+#include <zephyr/arch/arm64/cpu.h>
+#include <zephyr/arch/arm64/lib_helpers.h>
+#include <zephyr/sys/barrier.h>
+#include <zephyr/sys/device_mmio.h>
+#endif
+
 #include "io/io.h"
 #include "target.h"
 
@@ -387,6 +395,93 @@ static void do_boot(struct boot_rsp *rsp)
     /* Lock interrupts and dive into the entry point */
     irq_lock();
     vt->reset();
+}
+
+#elif defined(CONFIG_ARM64)
+
+#if !defined(MCUBOOT_RAM_LOAD)
+#error "MCUboot on ARM64 requires RAM load: images are not executed in place"
+#endif
+
+#if defined(CONFIG_DCACHE) && !defined(CONFIG_ARM64_DCACHE_ALL_OPS)
+#error "MCUboot on ARM64 needs CONFIG_ARM64_DCACHE_ALL_OPS to clean the data cache"
+#endif
+
+#if defined(CONFIG_MMU)
+/*
+ * MCUboot maps only its own image. Map the executable RAM area 1:1 and
+ * non-cacheable, so the image can be loaded there and no cache line of it is
+ * left when MCUboot jumps to it with the MMU off. An area that overlaps
+ * MCUboot's own image is mapped already.
+ */
+static int arm64_map_exec_ram(void)
+{
+    uintptr_t start = CONFIG_BOOT_IMAGE_EXECUTABLE_RAM_START;
+    size_t size = CONFIG_BOOT_IMAGE_EXECUTABLE_RAM_SIZE;
+    mm_reg_t virt;
+
+    if ((start < (uintptr_t)z_mapped_end) && ((uintptr_t)z_mapped_start < start + size)) {
+        return 0;
+    }
+
+    device_map(&virt, start, size, K_MEM_DIRECT_MAP | K_MEM_ARM_NORMAL_NC);
+    if (virt != start) {
+        BOOT_LOG_ERR("Cannot map executable RAM at 0x%lx", (unsigned long)start);
+        return -EFAULT;
+    }
+
+    return 0;
+}
+
+SYS_INIT(arm64_map_exec_ram, APPLICATION, 0);
+#endif /* CONFIG_MMU */
+
+/*
+ * Turn the EL1 MMU and data cache off and branch to the image. Only registers
+ * are used once the data cache is off, so no stale stack line can be read
+ * back. The image is entered as the ARM64 Linux boot protocol requires: MMU
+ * off, data cache off, all exceptions masked.
+ */
+static FUNC_NORETURN void arm64_jump_mmu_off(uintptr_t entry)
+{
+    __asm__ volatile("msr daifset, #0xf\n\t"
+                     "mrs x9, sctlr_el1\n\t"
+                     "bic x9, x9, %[mask]\n\t"
+                     "msr sctlr_el1, x9\n\t"
+                     "isb\n\t"
+                     "ic iallu\n\t"
+                     "tlbi vmalle1\n\t"
+                     "dsb sy\n\t"
+                     "isb\n\t"
+                     "br %[entry]\n\t"
+                     :
+                     : [mask] "r"((uint64_t)(SCTLR_M_BIT | SCTLR_C_BIT)),
+                       [entry] "r"(entry)
+                     : "x9", "memory");
+
+    CODE_UNREACHABLE;
+}
+
+static void do_boot(struct boot_rsp *rsp)
+{
+    uintptr_t entry = rsp->br_hdr->ih_load_addr + rsp->br_hdr->ih_hdr_size;
+
+    (void)irq_lock();
+
+    /* Stop the architected timers so no stale timer interrupt is pending
+     * when the image enables interrupts before reprogramming them.
+     */
+    write_cntv_ctl_el0(0);
+    write_sysreg(0, cntp_ctl_el0);
+    barrier_isync_fence_full();
+
+    /* Write every dirty line back to memory and drop it, so the image sees
+     * in memory what was written while the data cache was on.
+     */
+    (void)sys_cache_data_flush_and_invd_all();
+    (void)sys_cache_instr_invd_all();
+
+    arm64_jump_mmu_off(entry);
 }
 
 #else
